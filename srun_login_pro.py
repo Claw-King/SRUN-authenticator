@@ -31,7 +31,7 @@ GET_IP_API = os.getenv('GET_IP_API', os.getenv('get_ip_api', 'http://124.16.81.6
 SLEEP_TIME = int(os.getenv('SLEEP_TIME', '300'))
 
 # Advanced Configuration
-HEALTH_CHECK_URL = os.getenv('HEALTH_CHECK_URL', 'https://www.google.com/generate_204').strip() # Standard for connectivity checks
+HEALTH_CHECK_URL = os.getenv('HEALTH_CHECK_URL', 'https://www.baidu.com').strip() # Back to Baidu/CN-friendly by default
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # Seconds between retries in a single auth attempt
 
