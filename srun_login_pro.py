@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import json
 import requests
 import time
@@ -9,26 +8,37 @@ import math
 import os
 import logging
 import sys
+import signal
 from typing import Optional, Dict, Any
 
 # --- Configuration & Logging ---
+# Use a more readable logging format for Docker/systemd logs
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     stream=sys.stdout
 )
+logger = logging.getLogger("SRUN")
 
-# Configuration from Environment Variables (preferred)
+# Configuration from Environment Variables
 USERNAME = os.getenv('USERNAME', '').strip()
 PASSWORD = os.getenv('PASSWORD', '').strip()
-INIT_URL = os.getenv('INIT_URL', os.getenv('init_url', '')).strip()
-GET_CHALLENGE_API = os.getenv('GET_CHALLENGE_API', os.getenv('get_challenge_api', '')).strip()
-SRUN_PORTAL_API = os.getenv('SRUN_PORTAL_API', os.getenv('srun_portal_api', '')).strip()
-GET_IP_API = os.getenv('GET_IP_API', os.getenv('get_ip_api', '')).strip()
+INIT_URL = os.getenv('INIT_URL', os.getenv('init_url', 'https://portal.ucas.ac.cn')).strip()
+GET_CHALLENGE_API = os.getenv('GET_CHALLENGE_API', os.getenv('get_challenge_api', 'https://portal.ucas.ac.cn/cgi-bin/get_challenge')).strip()
+SRUN_PORTAL_API = os.getenv('SRUN_PORTAL_API', os.getenv('srun_portal_api', 'https://portal.ucas.ac.cn/cgi-bin/srun_portal')).strip()
+GET_IP_API = os.getenv('GET_IP_API', os.getenv('get_ip_api', 'http://124.16.81.61/cgi-bin/rad_user_info?callback=JQuery')).strip()
 SLEEP_TIME = int(os.getenv('SLEEP_TIME', '300'))
 
+# Advanced Configuration
+HEALTH_CHECK_URL = os.getenv('HEALTH_CHECK_URL', 'https://www.google.com/generate_204').strip() # Standard for connectivity checks
+MAX_RETRIES = 3
+RETRY_DELAY = 5 # Seconds between retries in a single auth attempt
+
 HEADER = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
 }
 
 # SRUN Constants
@@ -38,14 +48,23 @@ SRUN_AC_ID = '1'
 SRUN_ENC_VER = "srun_bx1"
 ALPHA = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
 
-# Global State (will be updated during execution)
+# Global State
 state = {
     'ip': '',
     'token': '',
     'hmd5': '',
     'chksum': '',
-    'info': ''
+    'info': '',
+    'running': True
 }
+
+# --- Signal Handling for Graceful Exit ---
+def signal_handler(sig, frame):
+    logger.info("Termination signal received. Exiting gracefully...")
+    state['running'] = False
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # --- Core Logic ---
 
@@ -149,26 +168,26 @@ def get_info() -> str:
     }
     return json.dumps(info_dict, separators=(',', ':'))
 
-def fetch_ip() -> bool:
+def fetch_ip(session: requests.Session) -> bool:
     try:
-        res = requests.get(GET_IP_API, timeout=10)
+        res = session.get(GET_IP_API, timeout=10)
         res.raise_for_status()
         match = re.search(r'jQuery\d+\((.*)\)', res.text)
         if not match:
-            logging.error(f"Failed to parse IP from response: {res.text[:100]}")
+            logger.error(f"Failed to parse IP from response: {res.text[:100]}")
             return False
         data = json.loads(match.group(1))
         state['ip'] = data.get('client_ip') or data.get('online_ip')
         if not state['ip']:
-            logging.error("No IP found in response data")
+            logger.error("No IP found in response data")
             return False
-        logging.info(f"Detected IP: {state['ip']}")
+        logger.info(f"Detected Network IP: {state['ip']}")
         return True
     except Exception as e:
-        logging.error(f"Error fetching IP: {e}")
+        logger.error(f"Error fetching IP: {e}")
         return False
 
-def fetch_token() -> bool:
+def fetch_token(session: requests.Session) -> bool:
     params = {
         "callback": f"jQuery1124{int(time.time() * 1000)}",
         "username": USERNAME,
@@ -176,24 +195,25 @@ def fetch_token() -> bool:
         "_": int(time.time() * 1000),
     }
     try:
-        res = requests.get(GET_CHALLENGE_API, params=params, headers=HEADER, timeout=10)
+        res = session.get(GET_CHALLENGE_API, params=params, headers=HEADER, timeout=10)
         res.raise_for_status()
         match = re.search('"challenge":"(.*?)"', res.text)
         if not match:
-            logging.error(f"Failed to fetch challenge token: {res.text[:100]}")
+            logger.error(f"Failed to fetch challenge token: {res.text[:100]}")
             return False
         state['token'] = match.group(1)
-        logging.info(f"Token acquired: {state['token']}")
+        logger.info(f"Challenge Token acquired: {state['token']}")
         return True
     except Exception as e:
-        logging.error(f"Error fetching token: {e}")
+        logger.error(f"Error fetching token: {e}")
         return False
 
-def is_connected() -> bool:
+def is_connected(session: requests.Session) -> bool:
+    """Uses a lightweight 204 No Content check to verify internet connectivity."""
     try:
-        # Baidu is reliable for testing connectivity in CN
-        requests.get("https://www.baidu.com", timeout=3)
-        return True
+        # 204 check is much faster than loading a full page
+        resp = session.get(HEALTH_CHECK_URL, timeout=5)
+        return resp.status_code in [200, 204]
     except:
         return False
 
@@ -203,7 +223,7 @@ def prepare_payloads():
     state['hmd5'] = get_md5(PASSWORD, state['token'])
     state['chksum'] = get_chksum()
 
-def do_login() -> bool:
+def do_login(session: requests.Session) -> bool:
     params = {
         'callback': f'jQuery1124{int(time.time() * 1000)}',
         'action': 'login',
@@ -221,38 +241,66 @@ def do_login() -> bool:
         '_': int(time.time() * 1000)
     }
     try:
-        res = requests.get(SRUN_PORTAL_API, params=params, headers=HEADER, timeout=10)
+        res = session.get(SRUN_PORTAL_API, params=params, headers=HEADER, timeout=10)
         res.raise_for_status()
-        logging.info(f"Login Response: {res.text}")
-        return "login_ok" in res.text.lower()
-    except Exception as e:
-        logging.error(f"Error during login request: {e}")
+        # Parse the JSONP response
+        match = re.search(r'jQuery\d+\((.*)\)', res.text)
+        if match:
+            result = json.loads(match.group(1))
+            if result.get('res') == 'ok':
+                logger.info("Authentication Successful!")
+                return True
+            else:
+                logger.error(f"Login Failed: {result.get('error_msg', 'Unknown Error')}")
+        else:
+            logger.error(f"Unexpected Login Response: {res.text[:100]}")
         return False
+    except Exception as e:
+        logger.error(f"Error during login request: {e}")
+        return False
+
+def authenticate():
+    """Higher-level auth flow with retries."""
+    with requests.Session() as session:
+        for attempt in range(MAX_RETRIES):
+            logger.info(f"Authentication attempt {attempt + 1}/{MAX_RETRIES}...")
+            if fetch_ip(session) and fetch_token(session):
+                prepare_payloads()
+                if do_login(session):
+                    return True
+            if attempt < MAX_RETRIES - 1:
+                logger.info(f"Waiting {RETRY_DELAY}s before next attempt...")
+                time.sleep(RETRY_DELAY)
+    return False
 
 def check_env():
     missing = []
-    for var in ['USERNAME', 'PASSWORD', 'GET_CHALLENGE_API', 'SRUN_PORTAL_API', 'GET_IP_API']:
-        if not os.getenv(var) and not globals().get(var):
+    for var in ['USERNAME', 'PASSWORD']:
+        if not os.getenv(var):
             missing.append(var)
     if missing:
-        logging.critical(f"Missing required configuration: {', '.join(missing)}")
+        logger.critical(f"Missing mandatory environment variables: {', '.join(missing)}")
         sys.exit(1)
 
 def run():
     check_env()
-    logging.info("SRUN Authenticator started.")
-    while True:
-        if is_connected():
-            logging.info("Network is connected. Staying quiet.")
-        else:
-            logging.info("Network disconnected. Attempting authentication...")
-            if fetch_ip() and fetch_token():
-                prepare_payloads()
-                if do_login():
-                    logging.info("Authentication successful.")
-                else:
-                    logging.info("Authentication failed. Will retry later.")
-        time.sleep(SLEEP_TIME)
+    logger.info("--- SRUN Authenticator Pro v2.0 ---")
+    logger.info(f"Target Portal: {INIT_URL}")
+    logger.info(f"Check Interval: {SLEEP_TIME}s")
+    
+    with requests.Session() as health_session:
+        while state['running']:
+            if is_connected(health_session):
+                logger.info("Internet connection is active.")
+            else:
+                logger.warning("No internet connection detected. Starting auth flow...")
+                if not authenticate():
+                    logger.error("All authentication attempts failed. Will retry next cycle.")
+            
+            # Use a smaller sleep loop to allow for faster signal response
+            for _ in range(SLEEP_TIME):
+                if not state['running']: break
+                time.sleep(1)
 
 if __name__ == '__main__':
     run()
